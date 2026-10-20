@@ -5,8 +5,8 @@ from django.db.models import Avg
 
 FLAVORS=['sweet','savory','spicy','sour','bitter']
 
-def taste_vector(flavors,budget):
-    values=[max(0,min(5,float(flavors.get(k,3))))/5 for k in FLAVORS]+[max(0,min(float(budget),200))/200]
+def taste_vector(flavors,budget=None):
+    values=[max(0,min(10,float(flavors.get(k,5))))/10 for k in FLAVORS]
     norm=math.sqrt(sum(v*v for v in values)) or 1
     return [round(v/norm,6) for v in values]
 
@@ -65,7 +65,7 @@ def rank_options(profile,filters,recipes,restaurants):
     dietary attributes and flavor. Personalized taste similarity contributes
     to final scores alongside genuine iterative graph centrality.
     """
-    budget=float(filters.get('budget') or profile.budget or 25)
+    budget=float(filters.get('budget') or 200)
     if not 0<budget<=200:raise ValueError('Budget must be between 1 and 200')
     mode=filters.get('mode','all');cuisine=(filters.get('cuisine') or profile.cuisine or '').casefold()
     mood=str(filters.get('mood','')).casefold()
@@ -80,26 +80,31 @@ def rank_options(profile,filters,recipes,restaurants):
         return not (exclusions & {str(x).casefold() for x in allergens}) and dietary.issubset({str(x).casefold() for x in labels}) and float(price)<=budget
     if mode in ('all','home'):
         for r in recipes:
-            if getattr(r,'cost_details',None) and not r.cost_details.get('complete',False):continue
-            if not safe(r.dietary,r.allergens,r.cost):continue
-            candidates.append(dict(type='recipe',id=r.id,title=r.title,subtitle=r.cuisine,price=float(r.cost),image=r.image,rating=round(_rating(r),1),dietary=r.dietary,description=r.description,flavors=getattr(r,'flavors',{}),distance_km=None))
+            # Unpriced recipes remain discoverable; never pretend their cost is known.
+            price_known=bool(getattr(r,'cost_details',None) and r.cost_details.get('complete',False))
+            if exclusions & {str(x).casefold() for x in r.allergens}:continue
+            if not dietary.issubset({str(x).casefold() for x in r.dietary}):continue
+            if price_known and float(r.cost)>budget:continue
+            if mood and mood not in [str(x).casefold() for x in r.mood]:continue
+            candidates.append(dict(type='recipe',id=r.id,title=r.title,subtitle=r.cuisine,price=float(r.cost) if price_known else None,image=r.image,rating=round(_rating(r),1),dietary=r.dietary,description=r.description,flavors=getattr(r,'flavors',{}),distance_km=None))
     if mode in ('all','restaurant'):
         for r in restaurants:
             matching=[m for m in r.menu.all() if safe(m.dietary,m.allergens,m.price)]
-            if not matching:continue
+            # Listings with no menu remain browsable, but are not declared allergy-safe.
+            if not matching and (exclusions or dietary):continue
             distance=None
             if location and 'lat' in location and 'lon' in location:
                 if r.latitude is None or r.longitude is None:continue
                 distance=haversine(location['lat'],location['lon'],r.latitude,r.longitude)
                 if radius is not None and distance>radius:continue
             elif radius is not None:continue
-            candidates.append(dict(type='restaurant',id=r.id,title=r.name,subtitle=r.cuisine,price=min(float(m.price) for m in matching),image=r.image,rating=round(_rating(r),1),dietary=matching[0].dietary,description=r.description,flavors={},distance_km=round(distance,2) if distance is not None else None))
+            candidates.append(dict(type='restaurant',id=r.id,title=r.name,subtitle=r.cuisine,price=min(float(m.price) for m in matching) if matching else None,image=r.image,rating=round(_rating(r),1),dietary=matching[0].dietary if matching else [],description=r.description,flavors={},distance_km=round(distance,2) if distance is not None else None))
     if not candidates:return []
     # k-nearest neighbours in normalized flavor-budget feature space.
-    target=profile.taste_vector or taste_vector(profile.flavors,profile.budget)
+    target=taste_vector(profile.flavors)
     for c in candidates:
         flavor=c['flavors'] if c['flavors'] else {k:(4 if mood and mood in c['description'].casefold() else 3) for k in FLAVORS}
-        vec=taste_vector(flavor,c['price'])
+        vec=taste_vector(flavor)
         c['taste_similarity']=max(0,cosine(target,vec))
     neighbors=sorted(candidates,key=lambda c:c['taste_similarity'],reverse=True)[:min(7,len(candidates))]
     neighbor_keys={(c['type'],c['id']) for c in neighbors}
@@ -110,16 +115,19 @@ def rank_options(profile,filters,recipes,restaurants):
             weight=.05
             if a['subtitle'].casefold()==b['subtitle'].casefold():weight+=1.0
             weight+=.25*len({x.casefold() for x in a['dietary']} & {x.casefold() for x in b['dietary']})
-            weight+=.4*max(0,1-abs(a['price']-b['price'])/max(budget,1))
+            if a['price'] is not None and b['price'] is not None:
+                weight+=.4*max(0,1-abs(a['price']-b['price'])/max(budget,1))
             if (b['type'],b['id']) in neighbor_keys:weight+=.7
             graph[i][j]=weight
     pr=pagerank(graph);highest=max(pr.values()) or 1
     for i,c in enumerate(candidates):
         rating=c['rating']/5
-        price_score=1-c['price']/budget
+        price_score=1-c['price']/budget if c['price'] is not None else 0
         cuisine_match=1 if cuisine and cuisine in c['subtitle'].casefold() else (.5 if not cuisine else 0)
         proximity=1/(1+c['distance_km']/10) if c['distance_km'] is not None else .5
         c['score']=round(.28*c['taste_similarity']+.22*pr[i]/highest+.20*rating+.12*price_score+.10*cuisine_match+.08*proximity,5)
-        c['reason']='Allergy-safe match · taste similarity {:.0%} · graph-ranked'.format(c['taste_similarity'])
+        c['reason']=('Profile-filtered' if exclusions or dietary else 'Taste-based')+' · taste similarity {:.0%} · PageRank graph score'.format(c['taste_similarity'])
+        if c['price'] is None:c['reason']+=' · price not verified'
+        if c['type']=='restaurant' and c['price'] is None:c['reason']+=' · menu not yet published'
         del c['dietary'];del c['description'];del c['flavors'];del c['taste_similarity']
     return sorted(candidates,key=lambda c:c['score'],reverse=True)[:24]

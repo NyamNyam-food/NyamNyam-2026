@@ -2,6 +2,7 @@
 from decimal import Decimal, InvalidOperation
 from .live_prices import live_recipe_cost
 from .models import IngredientPrice
+from django.core.cache import cache
 import requests
 
 SEARCH = 'https://world.openfoodfacts.org/cgi/search.pl'
@@ -22,15 +23,20 @@ def estimate_named_ingredients(items, country='LT', session=None):
         if not name or len(name)>100 or not qty.is_finite() or qty<=0 or unit not in ('g','kg','ml','l','piece'):
             raise ValueError('Each ingredient needs a name, positive quantity and valid unit.')
         try:
-            r=session.get(SEARCH, params={'search_terms':name,'search_simple':1,'action':'process','json':1,'page_size':12,'fields':'code,product_name,quantity'}, timeout=3,headers={'User-Agent':'NyamNyam/1.0 (coursework; product lookup)'})
-            r.raise_for_status()
-            products=r.json().get('products',[])
+            cached=cache.get('nyam_product_'+name.casefold())
+            if cached is not None:
+                products=cached
+            else:
+                r=session.get(SEARCH, params={'search_terms':name,'search_simple':1,'action':'process','json':1,'page_size':12,'fields':'code,product_name,quantity'}, timeout=3,headers={'User-Agent':'NyamNyam/1.0 (coursework; product lookup)'})
+                r.raise_for_status()
+                products=r.json().get('products',[])
+                cache.set('nyam_product_'+name.casefold(),products,60*60*12)
         except (requests.RequestException, ValueError, AttributeError):
             products=[]
         # Only accept plausible product names; no fuzzy substitution that silently changes ingredients.
         candidates=[p for p in products if name.casefold() in str(p.get('product_name','')).casefold() and str(p.get('code','')).isdigit()]
         quote=None
-        for product in candidates[:5]:
+        for product in candidates[:2]:
             result=live_recipe_cost([{'name':name,'barcode':product['code'],'quantity':str(qty),'unit':unit}],country=country,session=session)
             if result['complete']:
                 quote=result['priced_ingredients'][0]
