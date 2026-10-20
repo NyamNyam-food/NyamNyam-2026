@@ -4,7 +4,7 @@ from .models import Profile,Recipe
 from .logic import taste_vector,rank_options
 class RecommendationTests(TestCase):
  def setUp(self):
-  self.u=User.objects.create_user('test',password='securepass123');self.p=Profile.objects.create(user=self.u,allergies=['Peanuts'],budget=20)
+  self.u=User.objects.create_user('test',password='securepass123');self.p=Profile.objects.create(user=self.u,allergies=['Peanuts'])
  def test_normalized_vector(self):
   v=taste_vector({'sweet':5},20)
   self.assertAlmostEqual(sum(x*x for x in v),1,places=3)
@@ -15,7 +15,7 @@ class RecommendationTests(TestCase):
   self.assertEqual([x['title'] for x in out],['Safe'])
  def test_budget_exclusion(self):
   Recipe.objects.create(author=self.u,title='Expensive',cost=30)
-  self.assertEqual(rank_options(self.p,{'mode':'home'},Recipe.objects.all(),[]),[])
+  self.assertEqual(rank_options(self.p,{'mode':'home','budget':20},Recipe.objects.all(),[]),[])
 
 from .logic import pagerank,haversine,estimate_cost,cosine
 class AlgorithmTests(TestCase):

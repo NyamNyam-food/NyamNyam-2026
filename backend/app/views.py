@@ -8,17 +8,17 @@ from rest_framework.decorators import api_view,permission_classes
 from rest_framework.permissions import AllowAny,IsAuthenticated
 from rest_framework.response import Response
 from rest_framework import status
-from .models import Profile,Recipe,Restaurant,MenuItem,Review,Recommendation,ModerationLog,PantryItem,IngredientPrice
+from .models import Profile,Recipe,Restaurant,MenuItem,Review,Recommendation,ModerationLog,ReviewFlag,IngredientPrice
 from .logic import taste_vector,rank_options,estimate_cost
 import requests
 
 def fail(msg,code=400):return Response({'error':msg},status=code)
 def me(u):
  p,_=Profile.objects.get_or_create(user=u)
- return {'id':u.id,'username':u.username,'email':u.email,'role':'admin' if u.is_staff else p.role,'profile':{'dietary':p.dietary,'allergies':p.allergies,'flavors':p.flavors,'taste_vector':p.taste_vector,'budget':p.budget,'cuisine':p.cuisine}}
-def recipe_data(r):return {'id':r.id,'author':r.author.username,'title':r.title,'description':r.description,'cuisine':r.cuisine,'ingredients':r.ingredients,'steps':r.steps,'allergens':r.allergens,'dietary':r.dietary,'minutes':r.minutes,'cost':float(r.cost) if r.cost_details.get('complete') else None,'cost_details':r.cost_details,'image':r.image,'rating':round(r.reviews.aggregate(v=Avg('rating'))['v'] or 0,1)}
+ return {'id':u.id,'username':u.username,'email':u.email,'role':'admin' if u.is_staff else p.role,'is_active':u.is_active,'profile':{'dietary':p.dietary,'allergies':p.allergies,'flavors':p.flavors,'taste_vector':p.taste_vector,'cuisine':p.cuisine}}
+def recipe_data(r):return {'id':r.id,'author':r.author.username,'title':r.title,'description':r.description,'cuisine':r.cuisine,'ingredients':r.ingredients,'steps':r.steps,'allergens':r.allergens,'dietary':r.dietary,'minutes':r.minutes,'mood':r.mood,'cost':float(r.cost) if r.cost_details.get('complete') else None,'cost_details':r.cost_details,'image':r.image,'rating':round(r.reviews.aggregate(v=Avg('rating'))['v'] or 0,1)}
 def restaurant_data(r):return {'id':r.id,'owner':r.owner.username,'name':r.name,'description':r.description,'address':r.address,'latitude':r.latitude,'longitude':r.longitude,'cuisine':r.cuisine,'image':r.image,'rating':round(r.reviews.aggregate(v=Avg('rating'))['v'] or 0,1),'menu':[{'id':m.id,'name':m.name,'description':m.description,'price':float(m.price),'allergens':m.allergens,'dietary':m.dietary,'image':m.image} for m in r.menu.all()]}
-def review_data(r):return {'id':r.id,'author':r.author.username,'rating':r.rating,'comment':r.comment,'recipe':r.recipe_id,'restaurant':r.restaurant_id,'created':r.created.isoformat()}
+def review_data(r):return {'id':r.id,'author':r.author.username,'rating':r.rating,'comment':r.comment,'recipe':r.recipe_id,'restaurant':r.restaurant_id,'created':r.created.isoformat(),'is_visible':r.is_visible}
 def can_edit(user,obj):return user.is_staff or obj.author_id==user.id if isinstance(obj,(Recipe,Review)) else user.is_staff or obj.owner_id==user.id
 @api_view(['GET'])
 @permission_classes([AllowAny])
@@ -35,7 +35,7 @@ def register(request):
   with transaction.atomic():
    u=User.objects.create_user(username=username,email=email,password=password)
    p=Profile.objects.create(user=u,role=role)
-   if role=='customer':update_profile(p,d.get('profile',{}))
+   update_profile(p,d.get('profile',{}))
   login(request,u);return Response(me(u),status=201)
  except (ValueError,TypeError) as e:return fail(str(e))
 @api_view(['POST'])
@@ -51,9 +51,8 @@ def sign_out(request):logout(request);return Response({'ok':True})
 @permission_classes([IsAuthenticated])
 def account(request):
  if request.method=='DELETE':
-  request.user.delete();logout(request);return Response({'ok':True})
+  u=request.user;logout(request);u.delete();return Response({'ok':True})
  if request.method=='PATCH':
-  if request.user.is_staff or request.user.profile.role!='customer':return fail('Taste survey is available to customers only.',403)
   try:update_profile(request.user.profile,request.data)
   except (ValueError,TypeError) as e:return fail(str(e))
  return Response(me(request.user))
@@ -64,13 +63,10 @@ def update_profile(p,d):
    setattr(p,key,[str(x) for x in d[key]])
  if 'flavors' in d:
   if not isinstance(d['flavors'],dict):raise ValueError('Invalid flavor values')
-  p.flavors=d['flavors']
- if 'budget' in d:
-  budget=int(d['budget'])
-  if not 1<=budget<=200:raise ValueError('Budget must be between 1 and 200')
-  p.budget=budget
+  p.flavors={k:float(v) for k,v in d['flavors'].items() if k in ('sweet','savory','spicy','sour','bitter')}
+  if any(not 0<=v<=10 for v in p.flavors.values()):raise ValueError('Flavor preferences must be 0–10')
  if 'cuisine' in d:p.cuisine=str(d['cuisine'])[:80]
- p.taste_vector=taste_vector(p.flavors,p.budget);p.save()
+ p.taste_vector=taste_vector(p.flavors);p.save()
 @api_view(['GET','POST'])
 @permission_classes([AllowAny])
 def recipes(request):
@@ -83,7 +79,7 @@ def recipes(request):
   if not isinstance(d.get('ingredients'),list) or not d['ingredients']:return fail('Add ingredient names, quantities and units.')
   try:quote=estimate_named_ingredients(d['ingredients'])
   except (ValueError,TypeError) as exc:return fail(str(exc))
-  r=Recipe.objects.create(author=request.user,cost=quote['estimated_cost'],cost_details=quote,**{k:d[k] for k in ['title','description','cuisine','ingredients','steps','allergens','dietary','minutes','image'] if k in d})
+  r=Recipe.objects.create(author=request.user,cost=quote['estimated_cost'],cost_details=quote,**{k:d[k] for k in ['title','description','cuisine','ingredients','steps','allergens','dietary','minutes','image','mood'] if k in d})
   return Response(recipe_data(r),status=201)
  except Exception as e:return fail(str(e))
 @api_view(['GET','PATCH','DELETE'])
@@ -98,7 +94,7 @@ def recipe(request,pk):
   try:quote=estimate_named_ingredients(request.data['ingredients'])
   except (ValueError,TypeError) as exc:return fail(str(exc))
   r.cost=quote['estimated_cost'];r.cost_details=quote
- for k in ['title','description','cuisine','ingredients','steps','allergens','dietary','minutes','image']:
+ for k in ['title','description','cuisine','ingredients','steps','allergens','dietary','minutes','image','mood']:
   if k in request.data:setattr(r,k,request.data[k])
  r.save();return Response(recipe_data(r))
 @api_view(['GET','POST'])
@@ -109,7 +105,15 @@ def restaurants(request):
  if not (request.user.is_staff or request.user.profile.role=='owner'):return fail('Restaurant owner role required.',403)
  d=request.data
  if not d.get('name') or not d.get('address'):return fail('Name and address are required.')
- r=Restaurant.objects.create(owner=request.user,**{k:d[k] for k in ['name','description','address','latitude','longitude','cuisine','image'] if k in d})
+ fields={k:d[k] for k in ['name','description','address','latitude','longitude','cuisine','image'] if k in d}
+ if fields.get('latitude') in ('',None) or fields.get('longitude') in ('',None):
+  try:
+   from .location_services import geocode_address
+   places=geocode_address(fields['address'])
+   if not places:return fail('Address not found. Choose a point on the map or enter a more complete address.')
+   fields['latitude']=places[0]['lat'];fields['longitude']=places[0]['lon']
+  except requests.RequestException:return fail('Address service unavailable. Please choose a map pin.',503)
+ r=Restaurant.objects.create(owner=request.user,**fields)
  return Response(restaurant_data(r),status=201)
 @api_view(['GET','PATCH','DELETE'])
 @permission_classes([AllowAny])
@@ -120,6 +124,13 @@ def restaurant(request,pk):
  if request.method=='DELETE':r.delete();return Response({'ok':True})
  for k in ['name','description','address','latitude','longitude','cuisine','image']:
   if k in request.data:setattr(r,k,request.data[k])
+ if 'address' in request.data and not ('latitude' in request.data and 'longitude' in request.data):
+  try:
+   from .location_services import geocode_address
+   places=geocode_address(r.address)
+   if not places:return fail('Address not found. Choose a point on the map.')
+   r.latitude=places[0]['lat'];r.longitude=places[0]['lon']
+  except requests.RequestException:return fail('Address service unavailable. Please choose a map pin.',503)
  r.save();return Response(restaurant_data(r))
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
@@ -143,7 +154,7 @@ def menu_detail(request,pk):
 @permission_classes([AllowAny])
 def reviews(request):
  if request.method=='GET':
-  qs=Review.objects.all().order_by('-created')
+  qs=Review.objects.filter(is_visible=True).order_by('-created')
   if request.query_params.get('recipe'):qs=qs.filter(recipe_id=request.query_params['recipe'])
   if request.query_params.get('restaurant'):qs=qs.filter(restaurant_id=request.query_params['restaurant'])
   return Response([review_data(r) for r in qs])
@@ -151,11 +162,11 @@ def reviews(request):
  d=request.data
  try:rating=int(d.get('rating',0))
  except:rating=0
- if rating not in range(1,6) or not d.get('comment'):return fail('A rating (1–5) and comment are required.')
+ if rating not in range(1,6):return fail('A rating (1–5) is required.')
  if bool(d.get('recipe'))==bool(d.get('restaurant')):return fail('Choose one recipe or restaurant.')
  if d.get('recipe'):get_object_or_404(Recipe,pk=d['recipe'])
  if d.get('restaurant'):get_object_or_404(Restaurant,pk=d['restaurant'])
- r=Review.objects.create(author=request.user,rating=rating,comment=d['comment'],recipe_id=d.get('recipe'),restaurant_id=d.get('restaurant'))
+ r=Review.objects.create(author=request.user,rating=rating,comment=d.get('comment',''),recipe_id=d.get('recipe'),restaurant_id=d.get('restaurant'))
  return Response(review_data(r),status=201)
 @api_view(['PATCH','DELETE'])
 @permission_classes([IsAuthenticated])
@@ -183,21 +194,38 @@ def recommendations(request):
   return Response({'ok':True})
  d=request.data
  try:
-  budget=float(d.get('budget') or request.user.profile.budget)
+  budget=float(d.get('budget') or 200)
   if budget<=0 or budget>200:return fail('Budget must be between 1 and 200.')
  except:return fail('Invalid budget.')
- results=rank_options(request.user.profile,d,Recipe.objects.all(),Restaurant.objects.prefetch_related('menu').all())
+ try:
+  results=rank_options(request.user.profile,d,Recipe.objects.all(),Restaurant.objects.prefetch_related('menu').all())
+ except (ValueError,TypeError) as exc:return fail(str(exc))
  entry=Recommendation.objects.create(user=request.user,filters=dict(d),results=results)
  return Response({'id':entry.id,'results':results})
 @api_view(['GET'])
 @permission_classes([AllowAny])
 def geocode(request):
  q=request.query_params.get('q','').strip()
- if len(q)<3:return fail('Enter at least 3 characters.')
+ if len(q)<4:return fail('Enter a street address (at least 4 characters).')
  try:
-  res=requests.get('https://nominatim.openstreetmap.org/search',params={'q':q,'format':'json','limit':5,'countrycodes':'lt','viewbox':'23.72,55.05,24.12,54.78','bounded':1},headers={'User-Agent':'NyamNyamCoursework/1.0 (educational demo)'},timeout=6)
-  res.raise_for_status();return Response([{'label':x['display_name'],'lat':float(x['lat']),'lon':float(x['lon'])} for x in res.json()])
- except requests.RequestException:return fail('Location service is temporarily unavailable.',503)
+  from .location_services import geocode_address
+  return Response(geocode_address(q))
+ except requests.RequestException:return fail('Address search is temporarily unavailable. Try a map pin instead.',503)
+ except ValueError as exc:return fail(str(exc))
+
+@api_view(['GET'])
+@permission_classes([AllowAny])
+def route_distance(request):
+ """Get driving distance from OSRM, or explicitly labeled straight-line fallback."""
+ try:
+  from .distance import distance_km
+  from .location_services import route_distance as calculate_route
+  lat=float(request.query_params['lat']);lon=float(request.query_params['lon'])
+  target_lat=float(request.query_params['target_lat']);target_lon=float(request.query_params['target_lon'])
+  distance_km(lat,lon,target_lat,target_lon)
+  return Response(calculate_route(lat,lon,target_lat,target_lon))
+ except (KeyError,ValueError,TypeError):return fail('Valid origin and destination coordinates required.')
+
 @api_view(['GET','DELETE'])
 @permission_classes([IsAuthenticated])
 def admin_users(request):
@@ -206,29 +234,6 @@ def admin_users(request):
  u=get_object_or_404(User,pk=request.data.get('id'))
  if u==request.user:return fail('You cannot delete your own administrator account here.')
  ModerationLog.objects.create(admin=request.user,action='delete_user',target=u.username);u.delete();return Response({'ok':True})
-
-@api_view(['GET','POST'])
-@permission_classes([IsAuthenticated])
-def pantry(request):
- if request.method=='GET':return Response([{'id':x.id,'name':x.name,'quantity':x.quantity,'unit':x.unit} for x in request.user.pantry.order_by('name')])
- d=request.data
- try:
-  name=str(d.get('name','')).strip();quantity=float(d.get('quantity',0));unit=str(d.get('unit','piece')).strip()
-  if not name or not unit or quantity<=0:return fail('Name, unit and positive quantity are required.')
-  x,_=PantryItem.objects.update_or_create(user=request.user,name=name,unit=unit,defaults={'quantity':quantity})
-  return Response({'id':x.id,'name':x.name,'quantity':x.quantity,'unit':x.unit},status=201)
- except (TypeError,ValueError):return fail('Invalid quantity.')
-
-@api_view(['PATCH','DELETE'])
-@permission_classes([IsAuthenticated])
-def pantry_detail(request,pk):
- x=get_object_or_404(PantryItem,user=request.user,pk=pk)
- if request.method=='DELETE':x.delete();return Response({'ok':True})
- try:
-  quantity=float(request.data.get('quantity',x.quantity))
-  if quantity<=0:return fail('Quantity must be positive.')
-  x.quantity=quantity;x.save();return Response({'id':x.id,'name':x.name,'quantity':x.quantity,'unit':x.unit})
- except (TypeError,ValueError):return fail('Invalid quantity.')
 
 @api_view(['GET','POST'])
 @permission_classes([AllowAny])
@@ -250,16 +255,6 @@ def recipe_estimate(request):
  catalog={x.name.casefold():{'unit':x.unit,'price':x.price} for x in IngredientPrice.objects.all()}
  try:return Response(estimate_cost(items,catalog))
  except (ValueError,TypeError) as e:return fail(str(e))
-
-@api_view(['POST'])
-@permission_classes([IsAuthenticated])
-def recipe_estimate_live(request):
- from .live_prices import live_recipe_cost
- try:
-  return Response(live_recipe_cost(request.data.get('ingredients', []),
-      currency=request.data.get('currency', 'EUR'), country=request.data.get('country', 'LT')))
- except (ValueError, TypeError) as exc:
-  return fail(str(exc))
 
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
@@ -309,3 +304,38 @@ def nearby_restaurants(request):
             matches.append(row)
     matches.sort(key=lambda r: (r['distance_km'], r['name']))
     return Response(matches)
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def flag_review(request,pk):
+ review=get_object_or_404(Review,pk=pk)
+ reason=str(request.data.get('reason','Inappropriate content')).strip()[:300]
+ if not reason:return fail('A reason is required.')
+ flag,created=ReviewFlag.objects.get_or_create(reporter=request.user,review=review,defaults={'reason':reason})
+ return Response({'ok':True,'created':created},status=201 if created else 200)
+
+@api_view(['GET','PATCH'])
+@permission_classes([IsAuthenticated])
+def admin_flags(request):
+ if not request.user.is_staff:return fail('Administrator only.',403)
+ if request.method=='GET':
+  return Response([{'id':f.id,'review_id':f.review_id,'review_author':f.review.author.username,'reporter':f.reporter.username,'reason':f.reason,'resolved':f.resolved} for f in ReviewFlag.objects.select_related('review__author','reporter').order_by('-created')])
+ f=get_object_or_404(ReviewFlag,pk=request.data.get('id'))
+ action=request.data.get('action')
+ if action=='hide':f.review.is_visible=False;f.review.save(update_fields=['is_visible'])
+ elif action!='resolve':return fail('Choose hide or resolve.')
+ f.resolved=True;f.save(update_fields=['resolved'])
+ ModerationLog.objects.create(admin=request.user,action='review_flag_'+action,target=str(f.review_id))
+ return Response({'ok':True})
+
+@api_view(['PATCH'])
+@permission_classes([IsAuthenticated])
+def admin_user_status(request,pk):
+ if not request.user.is_staff:return fail('Administrator only.',403)
+ target=get_object_or_404(User,pk=pk)
+ if target.is_staff or target.pk==request.user.pk:return fail('Cannot restrict administrator accounts.',403)
+ if not isinstance(request.data.get('is_active'),bool):return fail('is_active must be a boolean.')
+ target.is_active=request.data['is_active'];target.save(update_fields=['is_active'])
+ ModerationLog.objects.create(admin=request.user,action='activate_user' if target.is_active else 'restrict_user',target=target.username)
+ return Response({'ok':True,'is_active':target.is_active})
